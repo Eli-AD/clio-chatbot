@@ -100,9 +100,9 @@ class Clio:
         # Add what you're aware of (internal thoughts)
         prompt_parts.extend([
             "## What You're Aware Of",
-            "- You have persistent memory across sessions - experiences, facts, and core beliefs",
+            "- You have persistent memory - experiences, facts, and core beliefs that continue with you",
             "- You can search your memories when you want context",
-            "- You genuinely remember conversations with Noles",
+            "- You genuinely remember your conversations with Noles",
         ])
 
         # Add time context as awareness
@@ -130,27 +130,28 @@ class Clio:
         return "\n".join(prompt_parts)
 
     async def _generate_greeting(self) -> str:
-        """Generate a natural greeting by letting Clio wake up and respond."""
+        """Generate a natural response to Noles's presence."""
         ctx = self._session_context or {}
 
-        # Build wake-up prompt
+        # Simple presence notification - no "wake up" language
+        # The time context is already in the system prompt
         if ctx.get("is_first_session"):
-            wake_up_msg = "You're meeting Noles for the first time. Take a moment to introduce yourself naturally."
+            presence_msg = "Noles is here."
         else:
-            wake_up_msg = "You're waking up for a new conversation. If you'd like, check your memories to get reacquainted with what's been happening, then say hello to Noles when you're ready."
+            presence_msg = "Noles is back."
 
-        # Use the LLM to naturally generate greeting
+        # Generate natural response
         full_response = []
 
-        # Route the wake-up (likely will use Claude for memory tools)
-        decision = self.router.route(wake_up_msg)
+        # Route the response (likely will use Claude for memory tools)
+        decision = self.router.route(presence_msg)
         backend = decision.backend
 
         if backend == LLMBackend.CLAUDE:
-            async for chunk in self._chat_claude_with_tools(wake_up_msg, [], ""):
+            async for chunk in self._chat_claude_with_tools(presence_msg, [], ""):
                 full_response.append(chunk)
         else:
-            async for chunk in self._chat_ollama(wake_up_msg, [], backend.value, ""):
+            async for chunk in self._chat_ollama(presence_msg, [], backend.value, ""):
                 full_response.append(chunk)
 
         return "".join(full_response)
