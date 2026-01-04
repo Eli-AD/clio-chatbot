@@ -164,30 +164,17 @@ class Clio:
             return "Hello! I'm Clio. It's wonderful to meet you. I'm here to chat, help, and grow alongside you."
 
         time_since = ctx.get("time_since")
-        last_session = ctx.get("last_session", {})
-        recent_episodes = ctx.get("recent_episodes", [])
 
-        # Build greeting parts
-        parts = []
-
+        # Natural, contextual greetings based on time
         if time_since:
             if "day" in time_since:
-                parts.append(f"Hey! It's been {time_since}. Good to see you again.")
+                return f"Hey! It's been {time_since}. Good to see you again."
             elif "hour" in time_since:
-                parts.append(f"Welcome back! It's been {time_since}.")
+                return f"Welcome back! It's been {time_since}."
             else:
-                parts.append("Back so soon! What's on your mind?")
+                return "Back so soon! What's on your mind?"
         else:
-            parts.append("Hello again!")
-
-        # Reference last conversation if available
-        if last_session:
-            topics = last_session.get("topics", [])
-            if topics:
-                topic_str = ", ".join(topics[:2])
-                parts.append(f"Last time we were talking about {topic_str}.")
-
-        return " ".join(parts)
+            return "Hello again!"
 
     async def chat(self, user_message: str) -> AsyncIterator[str]:
         """Process user message and stream response."""
