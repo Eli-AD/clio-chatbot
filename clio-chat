@@ -1,0 +1,4 @@
+#!/bin/bash
+# Convenience script to run Clio Chat
+cd "$(dirname "$0")"
+exec ./venv/bin/python chat.py "$@"
