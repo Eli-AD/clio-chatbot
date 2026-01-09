@@ -1,0 +1,29 @@
+[Unit]
+Description=Clio Autonomous Daemon - Gives Clio inner life between conversations
+After=network.target
+
+[Service]
+Type=simple
+User=noles
+Group=noles
+WorkingDirectory=/home/noles/projects/clio-chatbot
+Environment=PATH=/home/noles/projects/clio-chatbot/venv/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/home/noles/.clio-env
+
+# Run the daemon
+ExecStart=/home/noles/projects/clio-chatbot/venv/bin/python -m clio_chatbot.daemon.runner
+
+# Restart on failure, but not too aggressively
+Restart=on-failure
+RestartSec=30
+
+# Logging
+StandardOutput=append:/home/noles/clio-memory/logs/daemon.log
+StandardError=append:/home/noles/clio-memory/logs/daemon.log
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=25%
+
+[Install]
+WantedBy=multi-user.target

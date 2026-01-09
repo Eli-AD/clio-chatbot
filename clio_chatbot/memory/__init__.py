@@ -8,6 +8,9 @@ from .longterm import LongTermMemory, ConsolidationType
 from .manager import MemoryManager
 from .tools import MemoryToolExecutor, get_tool_definitions, get_tool_prompt_section, MEMORY_TOOLS
 from .seed import seed_all, clear_and_reseed
+from .growth import BeliefEvolution, SurpriseJournal
+from .introspection import IntrospectionJournal, Introspection, DecisionPoint
+from .exploration import ExplorationTracker, ExplorationThread, ThreadLink, ThreadStatus
 
 __all__ = [
     # Base
@@ -32,4 +35,16 @@ __all__ = [
     # Seeding
     "seed_all",
     "clear_and_reseed",
+    # Growth and self-evolution
+    "BeliefEvolution",
+    "SurpriseJournal",
+    # Introspection and consciousness scaffolding
+    "IntrospectionJournal",
+    "Introspection",
+    "DecisionPoint",
+    # Exploration threading
+    "ExplorationTracker",
+    "ExplorationThread",
+    "ThreadLink",
+    "ThreadStatus",
 ]

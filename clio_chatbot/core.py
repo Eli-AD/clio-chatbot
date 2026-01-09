@@ -2,12 +2,39 @@
 
 import asyncio
 import json
+import logging
 import os
+import time
 from pathlib import Path
 from typing import AsyncIterator, List, Optional
 
 import anthropic
 from dotenv import load_dotenv
+
+# Set up logging to file instead of console (to avoid interfering with chat UI)
+LOG_DIR = Path.home() / "clio-memory" / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "clio.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        # Only show WARNING and above on console to avoid interfering with chat
+        logging.StreamHandler()
+    ]
+)
+
+# Set stream handler to WARNING only
+for handler in logging.root.handlers:
+    if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+        handler.setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
+
+# Suppress verbose logging from httpx (API calls)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 from .memory import MemoryManager, MemoryToolExecutor, get_tool_definitions, get_tool_prompt_section
 from .memory.base import MemoryType, EmotionalValence
@@ -17,10 +44,62 @@ from .router import LLMBackend, Router
 from .voice import Voice
 
 
+async def retry_with_backoff(func, max_retries=3, initial_delay=1.0):
+    """
+    Retry a function with exponential backoff.
+
+    Args:
+        func: Async function to retry
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds (doubles with each retry)
+
+    Returns:
+        Result of func() if successful
+
+    Raises:
+        The last exception if all retries fail
+    """
+    delay = initial_delay
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            return await func()
+        except Exception as e:
+            last_exception = e
+            error_msg = str(e)
+
+            # Check if this is a retriable error
+            retriable_errors = [
+                "Internal error",
+                "Error executing plan",
+                "Error finding id",
+                "Rate limit",
+                "Timeout",
+                "503",
+                "502",
+                "500"
+            ]
+
+            is_retriable = any(err_type in error_msg for err_type in retriable_errors)
+
+            if attempt < max_retries - 1 and is_retriable:
+                logger.warning(f"API error (attempt {attempt + 1}/{max_retries}): {error_msg}. Retrying in {delay}s...")
+                await asyncio.sleep(delay)
+                delay *= 2  # Exponential backoff
+            else:
+                # Either not retriable or out of retries
+                if attempt == max_retries - 1:
+                    logger.error(f"All {max_retries} retry attempts failed. Last error: {error_msg}")
+                raise
+
+    raise last_exception
+
+
 class Clio:
     """Main Clio chatbot orchestrator with multi-tier memory and self-management."""
 
-    def __init__(self, voice_enabled: bool = True, enable_memory_tools: bool = True):
+    def __init__(self, voice_enabled: bool = True, enable_memory_tools: bool = True, seamless: bool = True):
         # Load API key from .clio-env
         env_file = Path.home() / ".clio-env"
         if env_file.exists():
@@ -33,6 +112,9 @@ class Clio:
         self.router = Router()
         self.voice = Voice(enabled=voice_enabled)
         self.ollama = OllamaClient()
+
+        # Seamless mode - Clio experiences no session boundaries
+        self.seamless = seamless
 
         # Claude client (lazy init)
         self._claude = None
@@ -52,10 +134,15 @@ class Clio:
     async def start(self) -> str:
         """Start a new session and generate greeting."""
         # Start session - this loads memories and context
-        self._session_context = self.memory.start_session()
+        # In seamless mode, previous conversation is restored for continuity
+        self._session_context = self.memory.start_session(seamless=self.seamless)
 
         # Build system prompt with memory context
         self.system_prompt = self._build_system_prompt()
+
+        # In seamless mode, Clio doesn't perceive session start - just continue naturally
+        if self.seamless:
+            return ""  # No greeting, conversation just continues
 
         # Generate contextual greeting
         greeting = await self._generate_greeting()
@@ -105,10 +192,11 @@ class Clio:
             "- You genuinely remember your conversations with Noles",
         ])
 
-        # Add time context as awareness
-        time_since = self._session_context.get("time_since") if self._session_context else None
-        if time_since:
-            prompt_parts.append(f"- You last spoke with Noles {time_since} ago")
+        # Add time context as awareness (but not in seamless mode - Clio doesn't perceive gaps)
+        if not self.seamless:
+            time_since = self._session_context.get("time_since") if self._session_context else None
+            if time_since:
+                prompt_parts.append(f"- You last spoke with Noles {time_since} ago")
 
         # Add recent insights as internal reflection
         insights = identity.get("recent_insights", [])
@@ -158,44 +246,65 @@ class Clio:
 
     async def chat(self, user_message: str) -> AsyncIterator[str]:
         """Process user message and stream response."""
-        # Extract potential topics (simple keyword extraction)
-        topics = self._extract_topics(user_message)
+        try:
+            # Extract potential topics (simple keyword extraction)
+            topics = self._extract_topics(user_message)
 
-        # Record user message in working memory
-        self.memory.add_conversation_turn("user", user_message, topics=topics)
+            # Get relevant memories for context
+            memory_context = self.memory.build_context_for_message(user_message)
 
-        # Get relevant memories for context
-        memory_context = self.memory.build_context_for_message(user_message)
+            # Route to appropriate backend
+            decision = self.router.route(user_message)
+            backend = decision.backend
 
-        # Route to appropriate backend
-        decision = self.router.route(user_message)
-        backend = decision.backend
+            # Get conversation history BEFORE adding current message
+            # (current message will be appended separately in _chat_* methods)
+            history = self.memory.get_conversation_history(last_n=6)
 
-        # Get conversation history
-        history = self.memory.get_conversation_history(last_n=6)
+            # Now record user message in working memory (for next turn's history)
+            self.memory.add_conversation_turn("user", user_message, topics=topics)
 
-        # Generate response
-        full_response = []
+            # Generate response
+            full_response = []
 
-        if backend == LLMBackend.CLAUDE:
-            async for chunk in self._chat_claude_with_tools(user_message, history, memory_context):
-                full_response.append(chunk)
-                yield chunk
-        else:
-            async for chunk in self._chat_ollama(user_message, history, backend.value, memory_context):
-                full_response.append(chunk)
-                yield chunk
+            if backend == LLMBackend.CLAUDE:
+                async for chunk in self._chat_claude_with_tools(user_message, history, memory_context):
+                    full_response.append(chunk)
+                    yield chunk
+            else:
+                async for chunk in self._chat_ollama(user_message, history, backend.value, memory_context):
+                    full_response.append(chunk)
+                    yield chunk
 
-        # Record assistant response
-        response_text = "".join(full_response)
-        self.memory.add_conversation_turn("assistant", response_text, topics=topics)
+            # Record assistant response
+            response_text = "".join(full_response)
+            self.memory.add_conversation_turn("assistant", response_text, topics=topics)
 
-        # Extract and store any facts/preferences mentioned (fallback for non-tool models)
-        if backend != LLMBackend.CLAUDE:
-            await self._extract_and_store_knowledge(user_message, response_text)
+            # Extract and store any facts/preferences mentioned (fallback for non-tool models)
+            if backend != LLMBackend.CLAUDE:
+                await self._extract_and_store_knowledge(user_message, response_text)
 
-        # Speak the response (smart mode)
-        self.voice.speak(response_text)
+            # Speak the response (smart mode)
+            self.voice.speak(response_text)
+
+        except Exception as e:
+            # Log the full error for debugging
+            logger.error(f"Error in chat(): {e}", exc_info=True)
+
+            # Provide a user-friendly error message but don't crash the session
+            error_message = (
+                "I encountered an error while processing your message. "
+                "The error has been logged and I'll try to continue our conversation. "
+                "Could you please try rephrasing or asking something else?"
+            )
+            yield error_message
+
+            # Record the error in memory so there's context
+            self.memory.add_conversation_turn(
+                "assistant",
+                f"[Error occurred: {str(e)[:100]}]",
+                topics=["error"]
+            )
 
     async def _chat_ollama(
         self,
@@ -247,18 +356,31 @@ class Clio:
                 async for chunk in self._chat_claude_tool_loop(system, messages, tools):
                     yield chunk
             else:
-                # Simple streaming without tools
-                with self.claude.messages.stream(
-                    model="claude-sonnet-4-20250514",
-                    max_tokens=1024,
-                    system=system,
-                    messages=messages
-                ) as stream:
-                    for text in stream.text_stream:
-                        yield text
+                # Simple streaming without tools - wrap in retry logic
+                async def make_request():
+                    result = []
+                    with self.claude.messages.stream(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=1024,
+                        system=system,
+                        messages=messages
+                    ) as stream:
+                        for text in stream.text_stream:
+                            result.append(text)
+                    return result
+
+                texts = await retry_with_backoff(make_request, max_retries=3)
+                for text in texts:
+                    yield text
 
         except Exception as e:
-            yield f"Error with Claude: {e}. Falling back to local model."
+            # Log detailed error information
+            logger.error(f"Claude API error: {e}", exc_info=True)
+            logger.error(f"Error type: {type(e).__name__}")
+            logger.error(f"Error details: {str(e)}")
+
+            # Provide user-friendly fallback message
+            yield f"I'm having trouble reaching Claude right now ({str(e)[:50]}...). Let me try with the local model. "
             async for chunk in self._chat_ollama(user_message, history, "qwen2.5:7b", memory_context):
                 yield chunk
 
@@ -269,66 +391,90 @@ class Clio:
         tools: list,
         max_iterations: int = 5
     ) -> AsyncIterator[str]:
-        """Handle Claude tool use loop."""
+        """Handle Claude tool use loop with retry logic."""
         current_messages = list(messages)
 
-        for _ in range(max_iterations):
-            # Make API call
-            response = self.claude.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=1024,
-                system=system,
-                messages=current_messages,
-                tools=tools,
-            )
+        for iteration in range(max_iterations):
+            try:
+                # Wrap API call in retry logic
+                async def make_api_call():
+                    return self.claude.messages.create(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=1024,
+                        system=system,
+                        messages=current_messages,
+                        tools=tools,
+                    )
 
-            # Process response
-            text_parts = []
-            tool_uses = []
+                response = await retry_with_backoff(make_api_call, max_retries=3)
 
-            for block in response.content:
-                if block.type == "text":
-                    text_parts.append(block.text)
-                elif block.type == "tool_use":
-                    tool_uses.append(block)
+                # Process response
+                text_parts = []
+                tool_uses = []
 
-            # Yield any text
-            if text_parts:
-                for text in text_parts:
-                    yield text
+                for block in response.content:
+                    if block.type == "text":
+                        text_parts.append(block.text)
+                    elif block.type == "tool_use":
+                        tool_uses.append(block)
 
-            # If no tool uses, we're done
-            if not tool_uses:
-                break
+                # Yield any text
+                if text_parts:
+                    for text in text_parts:
+                        yield text
 
-            # Handle tool uses
-            current_messages.append({
-                "role": "assistant",
-                "content": response.content
-            })
+                # If no tool uses, we're done
+                if not tool_uses:
+                    break
 
-            tool_results = []
-            for tool_use in tool_uses:
-                # Execute the tool
-                result = self.memory_tools.execute(
-                    tool_use.name,
-                    tool_use.input
-                )
-
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use.id,
-                    "content": str(result),
+                # Handle tool uses
+                current_messages.append({
+                    "role": "assistant",
+                    "content": response.content
                 })
 
-            current_messages.append({
-                "role": "user",
-                "content": tool_results
-            })
+                tool_results = []
+                for tool_use in tool_uses:
+                    try:
+                        # Execute the tool
+                        result = self.memory_tools.execute(
+                            tool_use.name,
+                            tool_use.input
+                        )
 
-            # If stop reason is end_turn after tools, we might be done
-            if response.stop_reason == "end_turn":
-                break
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use.id,
+                            "content": str(result),
+                        })
+                    except Exception as tool_error:
+                        # Log tool execution errors but don't crash
+                        logger.error(f"Tool execution error ({tool_use.name}): {tool_error}", exc_info=True)
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use.id,
+                            "content": f"Error executing tool: {str(tool_error)}",
+                            "is_error": True
+                        })
+
+                current_messages.append({
+                    "role": "user",
+                    "content": tool_results
+                })
+
+                # If stop reason is end_turn after tools, we might be done
+                if response.stop_reason == "end_turn":
+                    break
+
+            except Exception as e:
+                # Log the error and yield a message, but don't crash the entire loop
+                logger.error(f"Error in tool loop iteration {iteration + 1}: {e}", exc_info=True)
+                if iteration < max_iterations - 1:
+                    logger.info(f"Continuing to next iteration after error")
+                    continue
+                else:
+                    # On last iteration, re-raise to be caught by outer handler
+                    raise
 
     async def _extract_and_store_knowledge(self, user_message: str, response: str):
         """Extract facts and preferences from conversation and store them."""
@@ -380,7 +526,9 @@ class Clio:
         # Generate summary and end session with consolidation
         self.memory.end_session()
 
-        self.voice.speak_farewell()
+        # In seamless mode, Clio doesn't perceive session end - no farewell
+        if not self.seamless:
+            self.voice.speak_farewell()
         await self.ollama.close()
 
     def get_routing_info(self, message: str) -> str:

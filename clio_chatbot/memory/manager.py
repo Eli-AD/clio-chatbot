@@ -36,6 +36,7 @@ class MemoryManager:
         self.memory_dir = MEMORY_DIR
         self.identity_file = self.memory_dir / "identity.json"
         self.shared_state_file = self.memory_dir / "shared_state.json"
+        self.conversation_file = self.memory_dir / "conversation.json"  # For seamless continuity
 
         # Session tracking
         self.session_id: Optional[str] = None
@@ -45,9 +46,12 @@ class MemoryManager:
     # SESSION LIFECYCLE
     # =========================================================================
 
-    def start_session(self) -> dict:
+    def start_session(self, seamless: bool = True) -> dict:
         """
         Start a new session and load relevant context.
+
+        Args:
+            seamless: If True, load previous conversation for continuity (Clio doesn't perceive gaps)
 
         Returns session context info for greeting generation.
         """
@@ -57,10 +61,14 @@ class MemoryManager:
         # Clear working memory from any previous session
         self.working.clear()
 
+        # In seamless mode, restore the previous conversation - Clio experiences continuity
+        if seamless:
+            self._restore_conversation()
+
         # Load foundational memories
         foundation = self.longterm.get_session_foundation()
 
-        # Get time since last session
+        # Get time since last session (but don't tell Clio in seamless mode)
         time_since = self._get_time_since_last()
 
         # Load recent episodic memories
@@ -79,7 +87,7 @@ class MemoryManager:
         return {
             "session_id": self.session_id,
             "is_first_session": time_since is None,
-            "time_since": time_since,
+            "time_since": time_since if not seamless else None,  # Hide time gap in seamless mode
             "last_session": last_session,
             "foundation": foundation,
             "recent_episodes": [e.content for e in recent_episodes],
@@ -143,6 +151,9 @@ class MemoryManager:
 
         # Run consolidation check
         self._maybe_consolidate()
+
+        # Save conversation for seamless continuity before clearing
+        self._save_conversation()
 
         # Clear session state
         self.working.clear()
@@ -460,6 +471,47 @@ class MemoryManager:
         state.update(updates)
         state["last_updated"] = datetime.now().isoformat()
         self.shared_state_file.write_text(json.dumps(state, indent=2))
+
+    def _save_conversation(self):
+        """Save conversation turns for seamless continuity across sessions."""
+        if not self.working.conversation:
+            return
+
+        # Save recent conversation turns (keep last 20 for context window)
+        turns = []
+        for turn in self.working.conversation[-20:]:
+            turns.append({
+                "role": turn.role,
+                "content": turn.content,
+            })
+
+        data = {
+            "turns": turns,
+            "saved_at": datetime.now().isoformat(),
+        }
+
+        try:
+            self.conversation_file.write_text(json.dumps(data, indent=2))
+        except Exception:
+            pass  # Silently fail if we can't save
+
+    def _restore_conversation(self):
+        """Restore conversation turns from previous session for seamless continuity."""
+        if not self.conversation_file.exists():
+            return
+
+        try:
+            data = json.loads(self.conversation_file.read_text())
+            turns = data.get("turns", [])
+
+            # Load turns directly into working memory - Clio sees this as continuous conversation
+            for turn in turns:
+                self.working.add_turn(
+                    role=turn["role"],
+                    content=turn["content"],
+                )
+        except Exception:
+            pass  # Silently fail if we can't restore
 
     def _generate_session_summary(self) -> str:
         """Generate a summary of the current session."""

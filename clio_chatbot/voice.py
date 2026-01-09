@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 SPEAK_SCRIPT = Path("/tmp/speak.sh")
-WORD_THRESHOLD = 100  # Speak full if under this many words
+WORD_THRESHOLD = 500  # Speak full if under this many words
 
 
 class Voice:
